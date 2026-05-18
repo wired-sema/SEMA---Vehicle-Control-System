@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <esp_task_wdt.h>
 
 // ─── CORE 0 MODULES ───
 #include "core0/uart.h"
@@ -20,16 +21,24 @@ TaskHandle_t TaskHandle_Comm    = NULL;
 TaskHandle_t TaskHandle_UI      = NULL;
 TaskHandle_t TaskHandle_Web     = NULL;
 
+// ─── WATCHDOG CONFIGURATION ─────────────────────────────────────
+#define WDT_TIMEOUT_SECONDS 10
+
 // ════════════════════════════════════════════════════════════════
 //  CORE 1: HARD REAL-TIME EXECUTION (THE REFLEX)
 //  Cannot be interrupted by background serial/Wi-Fi operations.
 // ════════════════════════════════════════════════════════════════
 
 void Task_Control(void *pvParameters) {
+
+    esp_task_wdt_add(NULL);
+
     TickType_t xLastWakeTime = xTaskGetTickCount();
     const TickType_t xFrequency = pdMS_TO_TICKS(10); // 10 ms execution loop
-    
+
     for (;;) {
+        esp_task_wdt_reset();
+
         // 1. Evaluate Master FSM & Safety Overrides
         Mode_Update();
         
@@ -64,10 +73,16 @@ void Task_Display(void *pvParameters) {
 // ════════════════════════════════════════════════════════════════
 
 void Task_Comm(void *pvParameters) {
+
+    esp_task_wdt_add(NULL);
+
     TickType_t xLastWakeTime = xTaskGetTickCount();
     const TickType_t xFrequency = pdMS_TO_TICKS(10); // 10 ms execution loop
     
     for (;;) {
+
+        esp_task_wdt_reset();
+
         // Intercept and CRC-validate Jetson UART packets
         Uart_Update(); 
         vTaskDelayUntil(&xLastWakeTime, xFrequency);
@@ -103,6 +118,8 @@ void setup() {
     Serial.begin(115200);
     delay(300);
     Serial.println("\n[SYSTEM] SIDLAK 2 VCS - Booting Dual-Core Architecture");
+
+    esp_task_wdt_init(WDT_TIMEOUT_SECONDS, true);
 
     // ─── Initialize Modules (Hardware Setup) ───
     Calibration_Init();

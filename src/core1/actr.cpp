@@ -4,6 +4,11 @@
 #include "config/constants.h"
 #include "core0/calibration.h"
 
+// ─── RELAY CONSTANTS ────────────────────────────────────────────
+// Normally Closed (NC) = Manual | Normally Open (NO) = Auto
+#define RELAY_ENERGIZED   LOW   // Coil gets power, NO closes
+#define RELAY_DEENERGIZED HIGH  // Coil loses power, NC closes
+
 enum ActuatorState { ACT_IDLE, ACT_EXTENDING, ACT_RETRACTING };
 static ActuatorState act_state = ACT_IDLE;
 static uint32_t act_start_ms = 0;
@@ -38,8 +43,10 @@ void Actr_Init() {
     // Relays
     pinMode(BRAKE_MC_PIN, OUTPUT);
     pinMode(RELAY_PIN, OUTPUT);
+    
+    // Default to Safe State on boot
     digitalWrite(BRAKE_MC_PIN, HIGH); // Engaged/Safe
-    digitalWrite(RELAY_PIN, HIGH);    // OFF
+    digitalWrite(RELAY_PIN, RELAY_DEENERGIZED); // OFF (NC - Manual Mode)
     
     // Limit Switch
     pinMode(LIMIT_SWITCH_PIN, INPUT_PULLUP);
@@ -56,11 +63,15 @@ void Actr_Update() {
     globalState.brake_at_limit = at_limit;
     portEXIT_CRITICAL(&stateMux);
 
-    // 2. Throttle Delivery 
-    if (snap.target_mode == 50) { // AUTONOMOUS
+    // 2. Throttle Delivery & Relay Status Firewalls
+    if (snap.target_mode == 50) { 
+        // --- AUTONOMOUS ---
+        digitalWrite(RELAY_PIN, RELAY_ENERGIZED); // Clicks to NO
         set_throttle_pwm(snap.target_speed_pwm);
-    } else { // IDLE / MANUAL (Hardware safety cutoff)
-        set_throttle_pwm(0);
+    } else { 
+        // --- IDLE / MANUAL ---
+        digitalWrite(RELAY_PIN, RELAY_DEENERGIZED); // Falls back to NC
+        set_throttle_pwm(0); // Hardware safety cutoff
     }
 
     // 3. Brake Actuator State Machine (Non-Blocking)
@@ -72,8 +83,8 @@ void Actr_Update() {
             act_state = ACT_EXTENDING;
             act_start_ms = millis();
         } 
-        else if (snap.target_brake <= 50 && act_state == ACT_IDLE /* Assuming retract state check is needed */) {
-            // Add custom logic here if a retraction stroke is necessary when brake is released
+        else if (snap.target_brake <= 50 && act_state == ACT_IDLE) {
+            // Optional: Retract logic when brake is released
         }
     }
 
