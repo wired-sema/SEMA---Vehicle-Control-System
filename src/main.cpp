@@ -1,194 +1,132 @@
+// ============================================================
+//  main.cpp — SIDLAK 2 VCS
+//  Team Wired PH0017003 | Shell Eco-marathon 2026
+//
+//  Changes from previous revision:
+//  • Added DebugTask (priority 1, Core 0) — serial debug mode
+//  • DisplayLoop now calls updateDebugDisplay() when in debug mode
+// ============================================================
+
 #include <Arduino.h>
+#include "vcs_pins.h"
+#include "vcs_constants.h"
+#include "vcs_state_machine.h"
+#include "vcs_uart.h"
+#include "vcs_throttle.h"
+#include "vcs_lowbrake.h"
+#include "vcs_deadman.h"
+#include "vcs_relays.h"
+#include "vcs_steering.h"
+#include "vcs_hallsensor.h"
+#include "vcs_reverse.h"
+#include "vcs_display.h"
+#include "vcs_simulation.h"
+#include "vcs_web.h"
+#include "vcs_debug.h"
 #include <esp_task_wdt.h>
 
-// ─── CORE 0 MODULES ───
-#include "core0/uart.h"
-#include "core0/mode.h"
-#include "core0/web.h"
-#include "core0/calibration.h"
+TaskHandle_t ControlTaskHandle = NULL;
+static constexpr bool VCS_VERBOSE_TASK_LOGS = false;
+extern void WebServerTask(void *pvParameters);
 
-// ─── CORE 1 MODULES ───
-#include "core1/steer.h"
-#include "core1/actr.h"
-#include "core1/hall.h"
-#include "core1/rev.h"
-#include "core1/ui.h"
+static constexpr uint32_t WDT_TIMEOUT_SEC = 5;
 
-// ─── TASK HANDLES ───────────────────────────────────────────────
-TaskHandle_t TaskHandle_Control = NULL;
-TaskHandle_t TaskHandle_Display = NULL;
-TaskHandle_t TaskHandle_Comm    = NULL;
-TaskHandle_t TaskHandle_UI      = NULL;
-TaskHandle_t TaskHandle_Web     = NULL;
+// Cached steering reading: set by CommTask, consumed by DisplayLoop.
+// Prevents the slew-rate limit in getMeasuredSteering() from being
+// applied more than once per control cycle.
+static volatile uint16_t cachedSteering = COMM_STEER_CENTER;
 
-// ─── WATCHDOG CONFIGURATION ─────────────────────────────────────
-#define WDT_TIMEOUT_SECONDS 10
-
-// ════════════════════════════════════════════════════════════════
-//  CORE 1: HARD REAL-TIME EXECUTION (THE REFLEX)
-//  Cannot be interrupted by background serial/Wi-Fi operations.
-// ════════════════════════════════════════════════════════════════
-
-void Task_Control(void *pvParameters) {
-
+// ─────────────────────────────────────────────────────────────
+//  TASKS
+// ─────────────────────────────────────────────────────────────
+void ControlTask(void *pvParameters) {
     esp_task_wdt_add(NULL);
-
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(10); // 10 ms execution loop
-
     for (;;) {
         esp_task_wdt_reset();
-
-        // 1. Evaluate Master FSM & Safety Overrides
-        Mode_Update();
-        
-        // 2. Drive the Stepper PID Engine
-        Steer_Update();
-        
-        // 3. Write target speeds to DAC and evaluate Relay states
-        Actr_Update();
-        
-        // 4. Validate directional shifts
-        Rev_Update();
-
-        // Halt task until the 10ms window completes
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        updateStateMachine();
+        vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 }
 
-void Task_Display(void *pvParameters) {
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(50); // 50 ms execution loop
-    
-    for (;;) {
-        // Reads cached memory arrays to update the OLED without calculating data
-        UI_Update();
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
-    }
+void runCommCycle() {
+    cachedSteering = getMeasuredSteering();
+
+    handleIncomingUART();
+    updateDeadman();
+    updateLowBrake();
+    updateReverse();
+    updateUART();
+    updateHallCalculations();
+    updateThrottle(getMeasuredRPM(), getTargetRPM());
+    updateSteeringPID(getTargetSteering(), isAutonomousMode());
+    updateRelays(isAutonomousMode());
 }
 
-// ════════════════════════════════════════════════════════════════
-//  CORE 0: COMMUNICATION & BACKGROUND (THE BRIDGE)
-//  Isolates network interactions from physical vehicle control.
-// ════════════════════════════════════════════════════════════════
-
-void Task_Comm(void *pvParameters) {
-
+void ESP32_CommLoop(void *pvParameters) {
+    //initSteering();    
     esp_task_wdt_add(NULL);
-
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(10); // 10 ms execution loop
-    
     for (;;) {
-
         esp_task_wdt_reset();
-
-        // Intercept and CRC-validate Jetson UART packets
-        Uart_Update(); 
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        runCommCycle();
+        vTaskDelay(10 / portTICK_PERIOD_MS);
     }
 }
 
-void Task_UI(void *pvParameters) {
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(50); // 50 ms execution loop
-    
+void ESP32_UILoop(void *pvParameters) {
+    esp_task_wdt_add(NULL);
+    uint8_t gear = 1;
     for (;;) {
-        // Manage high-level diagnostic data structures
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        esp_task_wdt_reset();
+        broadcastVehicleTelemetry(gear);
+        vTaskDelay(50 / portTICK_PERIOD_MS);
     }
 }
 
-void Task_Web(void *pvParameters) {
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xFrequency = pdMS_TO_TICKS(50); // 50 ms execution loop
-    
+void DisplayLoop(void *pvParameters) {
+    // No esp_task_wdt_add here — display is non-critical, a hang
+    // should not reboot the vehicle control system.
     for (;;) {
-        // Push 20Hz telemetry via WebSockets to local dashboard
-        Web_Update(); 
-        vTaskDelayUntil(&xLastWakeTime, xFrequency);
+        if (g_debug_mode) {
+            updateDebugDisplay();
+        } else {
+            updateDisplay(getMeasuredRPM(), cachedSteering);
+        }
+        vTaskDelay(50 / portTICK_PERIOD_MS);
     }
 }
 
-// ════════════════════════════════════════════════════════════════
-//  SYSTEM BOOT
-// ════════════════════════════════════════════════════════════════
-
+// ─────────────────────────────────────────────────────────────
+//  SETUP
+// ─────────────────────────────────────────────────────────────
 void setup() {
+    dacWrite(PIN_THROTTLE_OUT, 0);   // MUST be absolute first line
+
     Serial.begin(115200);
-    delay(300);
-    Serial.println("\n[SYSTEM] SIDLAK 2 VCS - Booting Dual-Core Architecture");
+    Serial.println(F("\n--- VCS SIDLAK2 ESP32 ---"));
+    Serial.println(F("Type 'debug' for debug/calibration mode"));
 
-    esp_task_wdt_init(WDT_TIMEOUT_SECONDS, true);
+    esp_task_wdt_init(WDT_TIMEOUT_SEC, true);
 
-    // ─── Initialize Modules (Hardware Setup) ───
-    Calibration_Init();
-    Uart_Init();
-    Mode_Init();
-    Web_Init();
-    
-    Steer_Init();
-    Actr_Init();
-    Hall_Init();      // Attaches the wheel encoder ISR
-    Rev_Init();
-    UI_Init();
+    Serial.print(F("1. State...   ")); initState_Machine();  Serial.println(F("OK"));
+    Serial.print(F("2. UART...    ")); initUART();            Serial.println(F("OK"));
+    Serial.print(F("3. Throttle.. ")); initThrottle();        Serial.println(F("OK"));
+    Serial.print(F("4. Brake...   ")); initLowBrake();        Serial.println(F("OK"));
+    Serial.print(F("5. Deadman... ")); initDeadman();         Serial.println(F("OK"));
+    Serial.print(F("6. Relays...  ")); initRelays();          Serial.println(F("OK"));
+    Serial.print(F("7. Steering.. ")); initSteering();        Serial.println(F("OK"));
+    Serial.print(F("8. Hall...    ")); initHallSensors();     Serial.println(F("OK"));
+    Serial.print(F("9. Reverse... ")); initReverse();         Serial.println(F("OK"));
+    Serial.print(F("10. Display.. ")); initDisplay();         Serial.println(F("OK"));
+    Serial.println(F("--- BOOT COMPLETE ---"));
 
-    Serial.println("[SYSTEM] Hardware initialized. Dispatching FreeRTOS tasks...");
-
-    // ─── CORE 1: THE REFLEX (Safety & Hardware) ───
-    xTaskCreatePinnedToCore(
-        Task_Control,          // Function to implement the task
-        "ControlTask",         // Name of the task
-        4096,                  // Stack size in words
-        NULL,                  // Task input parameter
-        5,                     // Priority: 5 (Highest)
-        &TaskHandle_Control,   // Task handle
-        1);                    // Core: 1
-
-    xTaskCreatePinnedToCore(
-        Task_Display,          
-        "DisplayLoop",         //
-        4096,                  
-        NULL,                  
-        1,                     // Priority: 1
-        &TaskHandle_Display,   
-        1);                    // Core: 1
-
-    // ─── CORE 0: THE BRIDGE (Comms & Networking) ───
-    xTaskCreatePinnedToCore(
-        Task_Comm,             
-        "ESP32_CommLoop",      //
-        4096,                  
-        NULL,                  
-        4,                     // Priority: 4
-        &TaskHandle_Comm,      
-        0);                    // Core: 0
-
-    xTaskCreatePinnedToCore(
-        Task_UI,               
-        "ESP32_UILoop",        //
-        2048,                  
-        NULL,                  
-        2,                     // Priority: 2
-        &TaskHandle_UI,        
-        0);                    // Core: 0
-
-    xTaskCreatePinnedToCore(
-        Task_Web,              
-        "WebServerTask",       //
-        4096,                  
-        NULL,                  
-        1,                     // Priority: 1 (Lowest)
-        &TaskHandle_Web,       
-        0);                    // Core: 0
-
-    Serial.println("[SYSTEM] Scheduler active.");
-
-    // Delete the default Arduino loop() task to reclaim memory, 
-    // as FreeRTOS is now entirely in control.
-    vTaskDelete(NULL);
+    xTaskCreatePinnedToCore(ControlTask,    "Control",   4096, NULL, 5, &ControlTaskHandle, 1);
+    xTaskCreatePinnedToCore(ESP32_CommLoop, "Comms",     4096, NULL, 4, NULL,               0);
+    xTaskCreatePinnedToCore(ESP32_UILoop,   "UI",        4096, NULL, 2, NULL,               0);
+    xTaskCreatePinnedToCore(DisplayLoop,    "Display",   4096, NULL, 1, NULL,               1);
+    xTaskCreatePinnedToCore(WebServerTask,  "WebServer", 8192, NULL, 1, NULL,               0);
+    xTaskCreatePinnedToCore(DebugTask,      "Debug",     4096, NULL, 1, NULL,               1);
 }
 
 void loop() {
-    // Execution will never reach this block.
+    // All work in FreeRTOS tasks
 }
